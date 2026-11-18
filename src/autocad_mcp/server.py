@@ -8,8 +8,8 @@ from __future__ import annotations
 import structlog
 from mcp.server.fastmcp import FastMCP
 
+from autocad_mcp import __version__
 from autocad_mcp.client import (
-    _error,
     _json,
     _safe,
     add_screenshot_if_available,
@@ -30,7 +30,7 @@ mcp = FastMCP("autocad-mcp")
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD Drawing Operations", "readOnlyHint": False})
+@mcp.tool(annotations={"title": "AutoCAD Drawing Operations", "readOnlyHint": False}, structured_output=False)
 @_safe("drawing")
 async def drawing(
     operation: str,
@@ -85,7 +85,7 @@ async def drawing(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD Entity Operations", "readOnlyHint": False})
+@mcp.tool(annotations={"title": "AutoCAD Entity Operations", "readOnlyHint": False}, structured_output=False)
 @_safe("entity")
 async def entity(
     operation: str,
@@ -109,7 +109,7 @@ async def entity(
       create_arc        — data: {cx, cy, radius, start_angle, end_angle}, layer?
       create_ellipse    — data: {cx, cy, major_x, major_y, ratio}, layer?
       create_mtext      — data: {x, y, width, text, height?}, layer?
-      create_hatch      — entity_id, data: {pattern?}
+      create_hatch      — entity_id, data: {pattern?, scale?, angle?}  (pattern SOLID for a fill)
 
     Read operations:
       list              — layer? → list entities
@@ -147,7 +147,7 @@ async def entity(
     elif operation == "create_mtext":
         result = await backend.create_mtext(data["x"], data["y"], data["width"], data["text"], data.get("height", 2.5), layer)
     elif operation == "create_hatch":
-        result = await backend.create_hatch(entity_id, data.get("pattern", "ANSI31"))
+        result = await backend.create_hatch(entity_id, data.get("pattern", "ANSI31"), data.get("scale", 1.0), data.get("angle", 0.0))
     # --- Read ---
     elif operation == "list":
         result = await backend.entity_list(layer)
@@ -187,7 +187,7 @@ async def entity(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD Layer Operations", "readOnlyHint": False})
+@mcp.tool(annotations={"title": "AutoCAD Layer Operations", "readOnlyHint": False}, structured_output=False)
 @_safe("layer")
 async def layer(
     operation: str,
@@ -236,7 +236,7 @@ async def layer(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD Block Operations", "readOnlyHint": False})
+@mcp.tool(annotations={"title": "AutoCAD Block Operations", "readOnlyHint": False}, structured_output=False)
 @_safe("block")
 async def block(
     operation: str,
@@ -285,7 +285,7 @@ async def block(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD Annotation Operations", "readOnlyHint": False})
+@mcp.tool(annotations={"title": "AutoCAD Annotation Operations", "readOnlyHint": False}, structured_output=False)
 @_safe("annotation")
 async def annotation(
     operation: str,
@@ -339,7 +339,7 @@ async def annotation(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "P&ID Operations (CTO Library)", "readOnlyHint": False})
+@mcp.tool(annotations={"title": "P&ID Operations (CTO Library)", "readOnlyHint": False}, structured_output=False)
 @_safe("pid")
 async def pid(
     operation: str,
@@ -415,7 +415,7 @@ async def pid(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD View Operations", "readOnlyHint": True})
+@mcp.tool(annotations={"title": "AutoCAD View Operations", "readOnlyHint": True}, structured_output=False)
 @_safe("view")
 async def view(
     operation: str,
@@ -423,13 +423,14 @@ async def view(
     y1: float | None = None,
     x2: float | None = None,
     y2: float | None = None,
+    data: dict | None = None,
 ) -> ToolResult:
     """Viewport control and screenshot capture.
 
     Operations:
       zoom_extents   — Zoom to show all entities.
-      zoom_window    — Zoom to window: x1, y1, x2, y2
-      get_screenshot — Capture current view as PNG image.
+      zoom_window    — Zoom to window: x1, y1, x2, y2 (top-level or inside data)
+      get_screenshot — Capture PNG; data: {screenshot_path?: absolute new .png}.
     """
     backend = await get_backend()
 
@@ -437,15 +438,26 @@ async def view(
         result = await backend.zoom_extents()
         return _json(result.to_dict())
     elif operation == "zoom_window":
+        # Other tools take their arguments in `data`; accept that shape here too
+        d = data or {}
+        x1, y1, x2, y2 = (v if v is not None else d.get(k) for k, v in
+                          (("x1", x1), ("y1", y1), ("x2", x2), ("y2", y2)))
+        if None in (x1, y1, x2, y2):
+            return _json({"ok": False, "error": "zoom_window needs x1, y1, x2, y2"})
         result = await backend.zoom_window(x1, y1, x2, y2)
         return _json(result.to_dict())
     elif operation == "get_screenshot":
+        from autocad_mcp.evidence import screenshot_target, save_screenshot
+        screenshot_path = (data or {}).get("screenshot_path")
+        if screenshot_path:
+            screenshot_target(screenshot_path)
         result = await backend.get_screenshot()
         if result.ok and result.payload:
             from mcp.types import ImageContent, TextContent
 
+            evidence = save_screenshot(result.payload, screenshot_path) if screenshot_path else "attached"
             return [
-                TextContent(type="text", text=_json({"ok": True, "screenshot": "attached"})),
+                TextContent(type="text", text=_json({"ok": True, "screenshot": evidence})),
                 ImageContent(type="image", data=result.payload, mimeType="image/png"),
             ]
         return _json(result.to_dict())
@@ -458,7 +470,7 @@ async def view(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD MCP System", "readOnlyHint": True})
+@mcp.tool(annotations={"title": "AutoCAD MCP System", "readOnlyHint": True}, structured_output=False)
 @_safe("system")
 async def system(
     operation: str,
@@ -473,11 +485,22 @@ async def system(
       get_backend   — Return current backend name and capabilities.
       runtime       — Return process/runtime details for spawn diagnostics.
       init          — Re-initialize the backend.
+      revision      — Journaled native batch/read/export_page/frames/plot/save/checkpoint. data: {action, drawing, ...}
+      desktop       — Read Windows state/pending receipt without IPC init; data: {screenshot_path?}.
+      worker        — File queue lifecycle. data: {action: observe|prepare|stop|renew, drawing?, session?}. Renew saves and renews the same document; others bypass IPC init.
+      job           — Isolated AutoCAD LT job. launch: {action, drawing, ipc_dir, executable}; observe/attach/close: {action, path: absolute job.json}. No keyboard input; close saves first.
+      acknowledge   — Acknowledge reconciled completion or proven v2 cancellation. data: {request_id}
       execute_lisp  — Execute arbitrary AutoLISP code (File IPC only). data: {code}
+
+    revision/execute_lisp accept data.screenshot_path (new absolute PNG); saved evidence
+    includes bytes/hash. include_screenshot also attaches the image. No mutation retry.
     """
     data = data or {}
 
-    if operation == "status" or operation == "get_backend":
+    if operation == "job":
+        from autocad_mcp.native_job import manage
+        return _json(await manage(data))
+    elif operation == "status" or operation == "get_backend":
         backend = await get_backend()
         result = await backend.status()
         return await add_screenshot_if_available(result, include_screenshot)
@@ -491,6 +514,7 @@ async def system(
     elif operation == "runtime":
         import os
         import sys
+        from autocad_mcp.build import LOADED, manifest, qualification
 
         return _json(
             {
@@ -498,6 +522,12 @@ async def system(
                 "platform": sys.platform,
                 "python": sys.executable,
                 "cwd": os.getcwd(),
+                "pid": os.getpid(),
+                "module": __file__,
+                "native_transport_build": "queue-worker-v1",
+                "loaded_build": LOADED['sha256'],
+                "disk_build": manifest()['sha256'],
+                "native_qualification": qualification(),
                 "backend_env": os.environ.get("AUTOCAD_MCP_BACKEND", "auto"),
                 "wsl_interop": bool(os.environ.get("WSL_INTEROP")),
             }
@@ -509,12 +539,48 @@ async def system(
         backend = await get_backend()
         result = await backend.status()
         return _json(result.to_dict())
+    elif operation == "revision":
+        from autocad_mcp.revision import execute
+        from autocad_mcp.evidence import screenshot_target
+        data = dict(data)
+        screenshot_path = data.pop("screenshot_path", None)
+        if screenshot_path:
+            screenshot_target(screenshot_path)
+        backend = await get_backend()
+        result = await execute(backend, data.pop("action"), data)
+        return await add_screenshot_if_available(result, include_screenshot, screenshot_path)
+    elif operation == "worker":
+        from autocad_mcp.worker_control import control
+        from autocad_mcp.config import detect_backend, IPC_DIR, LISP_DIR
+        if detect_backend() != 'file_ipc':
+            return _json({'ok':False,'error':'NATIVE_BACKEND_REQUIRED'})
+        if data.get('action') == 'renew':
+            backend = await get_backend()
+            result = await backend.worker_transition('save')
+            return _json(result.to_dict())
+        return _json({'ok':True,'payload':control(IPC_DIR, data.get('action','observe'), data, LISP_DIR)})
+    elif operation == "desktop":
+        from autocad_mcp.desktop import diagnostics
+        from autocad_mcp.config import detect_backend, IPC_DIR
+        if detect_backend() != "file_ipc":
+            return _json({"ok": False, "error": "NATIVE_BACKEND_REQUIRED"})
+        return _json(diagnostics(IPC_DIR, data.get("screenshot_path")))
+    elif operation == "acknowledge":
+        from autocad_mcp.desktop import acknowledge
+        from autocad_mcp.config import detect_backend, IPC_DIR
+        if detect_backend() != "file_ipc":
+            return _json({"ok": False, "error": "NATIVE_BACKEND_REQUIRED"})
+        return _json(acknowledge(IPC_DIR, data["request_id"]))
     elif operation == "execute_lisp":
+        from autocad_mcp.evidence import screenshot_target
+        screenshot_path = data.get("screenshot_path")
+        if screenshot_path:
+            screenshot_target(screenshot_path)
         backend = await get_backend()
         if not data.get("code"):
             return _json({"error": "data.code is required"})
         result = await backend.execute_lisp(data["code"])
-        return await add_screenshot_if_available(result, include_screenshot)
+        return await add_screenshot_if_available(result, include_screenshot, screenshot_path)
     else:
         return _json({"error": f"Unknown system operation: {operation}"})
 
@@ -546,5 +612,5 @@ def main():
         ],
     )
 
-    log.info("autocad_mcp_starting", version="3.1.0")
+    log.info("autocad_mcp_starting", version=__version__)
     mcp.run(transport="stdio")

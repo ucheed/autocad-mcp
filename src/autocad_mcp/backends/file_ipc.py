@@ -1,17 +1,13 @@
-"""File-based IPC backend for AutoCAD LT.
+"""AutoCAD LT File IPC v2: request-specific trigger and atomic claim/cancel.
 
-Protocol:
-1. Python writes JSON command to C:/temp/autocad_mcp_cmd_{request_id}.json
-2. Python types the fixed string "(c:mcp-dispatch)" + Enter
-3. LISP reads cmd, dispatches via command map, writes result to
-   C:/temp/autocad_mcp_result_{request_id}.json
-4. Python polls for result file (100ms intervals, 10s timeout)
+A new document loads the dispatcher before the first request, not after a failed
+pickup. Requests are never automatically replayed. Claimed timeouts retain intent;
+unclaimed timeouts retain a verifiable cancellation envelope for acknowledgement.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 import time
@@ -21,33 +17,46 @@ from pathlib import Path
 import structlog
 
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
-from autocad_mcp.config import IPC_DIR, IPC_TIMEOUT, LISP_DIR
+from autocad_mcp.desktop import ipc_lease, inspect_pending
+from autocad_mcp.config import AUTOLOAD_DISPATCHER, IPC_DIR, IPC_LONG_TIMEOUT, IPC_TIMEOUT, LISP_DIR
+from autocad_mcp.ipc_protocol import PROTOCOL, cancel_unclaimed, paths, publish, read_json
+from autocad_mcp.native_input import post_expression
+from autocad_mcp.build import LOADED, require_unchanged, qualification
 
 log = structlog.get_logger()
 
 # IPC settings
 POLL_INTERVAL = 0.1  # seconds
 TIMEOUT = IPC_TIMEOUT  # seconds (configurable via AUTOCAD_MCP_IPC_TIMEOUT)
-STALE_THRESHOLD = 60.0  # clean up files older than this
+LONG_TIMEOUT = IPC_LONG_TIMEOUT  # execute_lisp / plot (AUTOCAD_MCP_IPC_LONG_TIMEOUT)
+PICKUP_TIMEOUT = 3.0  # seconds for the dispatcher to claim a command file
 
 
-def find_autocad_window() -> int | None:
+def find_autocad_window(pid: int | None = None) -> int | None:
     """Find the AutoCAD LT window handle by checking window titles."""
     if sys.platform != "win32":
         return None
     try:
         import win32gui
+        import win32process
 
         windows: list[int] = []
+        pin = str(pid) if pid is not None else os.environ.get('AUTOCAD_MCP_PID')
+        if pin and (not pin.isdecimal() or int(pin) <= 0):
+            raise RuntimeError('INVALID_AUTOCAD_PID')
 
         def callback(hwnd, result):
             if win32gui.IsWindowVisible(hwnd):
                 text = win32gui.GetWindowText(hwnd).lower()
-                if "autocad" in text and ("drawing" in text or ".dwg" in text):
+                if ("autocad" in text and ("drawing" in text or ".dwg" in text)
+                        and win32gui.GetClassName(hwnd).startswith('AfxMDIFrame')
+                        and (not pin or win32process.GetWindowThreadProcessId(hwnd)[1] == int(pin))):
                     result.append(hwnd)
             return True
 
         win32gui.EnumWindows(callback, windows)
+        if len(windows) > 1:
+            raise RuntimeError('AMBIGUOUS_AUTOCAD_PROCESSES; set AUTOCAD_MCP_PID')
         return windows[0] if windows else None
     except ImportError:
         return None
@@ -56,12 +65,27 @@ def find_autocad_window() -> int | None:
 class FileIPCBackend(AutoCADBackend):
     """File-based IPC with AutoCAD LT via mcp_dispatch.lsp."""
 
-    def __init__(self):
+    def __init__(self, *, worker_session: str | None = None, transport: str = 'worker'):
+        if transport not in ('worker', 'legacy') or (worker_session and transport != 'worker'):
+            raise ValueError('INVALID_IPC_TRANSPORT')
         self._hwnd: int | None = None
-        self._command_hwnd: int | None = None
         self._ipc_dir = Path(IPC_DIR)
         self._screenshot_provider = None
         self._lock = asyncio.Lock()  # Single in-flight command
+        self._worker_session = worker_session
+        self._worker_state = None
+        self._transport = transport
+
+    async def _worker_ready(self):
+        from autocad_mcp.worker import discover, wait_ready
+        require_unchanged()
+        if not self._worker_session:
+            self._worker_session = discover(self._ipc_dir)
+        self._worker_state = await wait_ready(self._ipc_dir, self._worker_session)
+        if self._worker_state.get('build') != LOADED['sha256']:
+            raise RuntimeError('NATIVE_WORKER_BUILD_MISMATCH')
+        if self._worker_state.get('writestat') != 1:
+            raise RuntimeError('WORKER_DRAWING_READ_ONLY')
 
     @property
     def name(self) -> str:
@@ -96,163 +120,219 @@ class FileIPCBackend(AutoCADBackend):
         except Exception:
             pass
 
-        # Find command-line child edit control for focus-free dispatch
-        self._command_hwnd = self._find_command_line_hwnd()
-        log.info("command_line_hwnd", hwnd=self._command_hwnd)
-
         # Ensure IPC directory exists
         self._ipc_dir.mkdir(parents=True, exist_ok=True)
 
         # Clean up stale IPC files
         self._cleanup_stale_files()
 
-        # Ping the dispatcher to verify it's loaded
-        result = await self._dispatch("ping", {})
+        # One fresh probe; any timeout is reconciled before further dispatch.
+        result = await self._dispatch("ping", {}, timeout=5.0)
         if not result.ok:
-            lisp_path = str(LISP_DIR / "mcp_dispatch.lsp").replace("\\", "/")
-            return CommandResult(
-                ok=False,
-                error=(
-                    "AutoCAD LT detected but mcp_dispatch.lsp not loaded.\n"
-                    f'In AutoCAD command line, type:\n  (load "{lisp_path}")\n'
-                    "Or add lisp-code/ to trusted paths for auto-loading."
-                ),
-            )
+            return result
 
-        return CommandResult(ok=True, payload={"backend": "file_ipc", "hwnd": self._hwnd})
+        payload = {"backend": "file_ipc", "hwnd": self._hwnd}
+        if isinstance(result.payload, dict):
+            payload.update({k: result.payload.get(k) for k in ("version", "drawing")})
+        return CommandResult(ok=True, payload=payload)
+
+    @property
+    def _lisp_path(self) -> str:
+        return str(LISP_DIR / "mcp_dispatch.lsp").replace("\\", "/")
 
     async def status(self) -> CommandResult:
         info = {
             "backend": "file_ipc",
             "hwnd": self._hwnd,
             "ipc_dir": str(self._ipc_dir),
+            "ipc_protocol": PROTOCOL,
+            "automatic_replay": False,
+            "input_transport": "native_queue_worker" if self._transport == 'worker' else "legacy_postmessage",
+            "worker_session": self._worker_session,
+            "loaded_build": LOADED['sha256'],
+            "native_qualification": qualification(),
             "capabilities": {k: v for k, v in self.capabilities.__dict__.items()},
         }
+        if self._worker_session:
+            from autocad_mcp.worker import observe
+            info['worker'] = observe(self._ipc_dir, self._worker_session)
         return CommandResult(ok=True, payload=info)
 
     # --- IPC dispatch ---
 
-    async def _dispatch(self, command: str, params: dict) -> CommandResult:
-        """Send a command via file IPC and wait for result."""
+    async def _dispatch(
+        self, command: str, params: dict, timeout: float | None = None
+    ) -> CommandResult:
+        """Serialize clients and refuse unresolved work. No automatic retry."""
         async with self._lock:
-            return await self._dispatch_unlocked(command, params)
+            try:
+                with ipc_lease(self._ipc_dir):
+                    if (self._ipc_dir / 'pcad-handoff.json').exists():
+                        return CommandResult(ok=False, error='IPC_HANDOFF_RECONCILE_REQUIRED')
+                    pending = inspect_pending(self._ipc_dir)
+                    if pending["pending"]:
+                        return CommandResult(
+                            ok=False, error="IPC_UNCERTAIN_RECONCILE_REQUIRED", payload=pending
+                        )
+                    if self._transport == 'worker':
+                        await self._worker_ready()
+                    result, _ = await self._dispatch_unlocked(command, params, timeout)
+                    return result
+            except RuntimeError as exc:
+                return CommandResult(ok=False, error=str(exc))
 
-    async def _dispatch_unlocked(self, command: str, params: dict) -> CommandResult:
-        """Core IPC logic (must be called under _lock)."""
+    async def worker_transition(self, mode, path=None, *, file_format=None, expected_drawing=None):
+        if mode == 'open':
+            return CommandResult(ok=False, error='WORKER_OPEN_NOT_QUALIFIED; stop and bootstrap explicitly in the intended document')
+        if self._transport != 'worker':
+            return CommandResult(ok=False, error='NATIVE_WORKER_REQUIRED')
+        from autocad_mcp.worker import normalize_drawing
+        from autocad_mcp.worker_transition import transition_locked
+        async with self._lock:
+            try:
+                with ipc_lease(self._ipc_dir):
+                    if inspect_pending(self._ipc_dir)['pending']:
+                        return CommandResult(ok=False, error='IPC_UNCERTAIN_RECONCILE_REQUIRED')
+                    if (self._ipc_dir/'pcad-handoff.json').exists():
+                        return CommandResult(ok=False, error='IPC_HANDOFF_RECONCILE_REQUIRED')
+                    await self._worker_ready()
+                    current = normalize_drawing(self._worker_state['drawing'])
+                    if expected_drawing and normalize_drawing(expected_drawing) != current:
+                        return CommandResult(ok=False, error='WORKER_TRANSITION_SOURCE_MISMATCH')
+                    if mode == 'save':
+                        path = path or current
+                        if file_format is None:
+                            with Path(current).open('rb') as stream:
+                                version = stream.read(6)
+                            file_format = {b'AC1024':48, b'AC1027':60, b'AC1032':64}.get(version)
+                            if file_format is None:
+                                return CommandResult(ok=False, error='DWG_FORMAT_NOT_QUALIFIED')
+                    else:
+                        file_format = 64 if file_format is None else file_format
+                    return await transition_locked(self, mode, path, file_format=file_format)
+            except (RuntimeError, ValueError, OSError) as exc:
+                return CommandResult(ok=False, error=str(exc))
+
+    async def _dispatch_unlocked(
+        self, command: str, params: dict, timeout: float | None = None
+    ) -> tuple[CommandResult, bool]:
         request_id = uuid.uuid4().hex[:12]
-        cmd_file = self._ipc_dir / f"autocad_mcp_cmd_{request_id}.json"
-        result_file = self._ipc_dir / f"autocad_mcp_result_{request_id}.json"
-        tmp_file = cmd_file.with_suffix(".tmp")
-
+        files = paths(self._ipc_dir, request_id)
+        pending_file = self._ipc_dir / "pcad-pending.json"
+        payload = {
+            "protocol": PROTOCOL,
+            "request_id": request_id,
+            "command": command,
+            "params": {k: v for k, v in params.items() if v is not None},
+            "ts": time.time(),
+        }
+        if self._worker_session:
+            from autocad_mcp.worker import normalize_drawing
+            payload.update(worker_session=self._worker_session,
+                           expected_drawing=normalize_drawing(self._worker_state['drawing']))
+        publish(pending_file, payload)
+        publish(files["ready"], payload)
+        archive = self._ipc_dir / "pcad-receipts"
+        archive.mkdir(exist_ok=True)
+        completed = False
+        delivery = None
         try:
-            # Strip None values — the simple LISP JSON parser can't handle null
-            clean_params = {k: v for k, v in params.items() if v is not None}
-            # Atomic write: write to .tmp, then rename
-            payload = {
-                "request_id": request_id,
-                "command": command,
-                "params": clean_params,
-                "ts": time.time(),
-            }
-            tmp_file.write_text(json.dumps(payload), encoding="utf-8")
-            tmp_file.rename(cmd_file)
-
-            # Type the fixed dispatch trigger
-            self._type_dispatch_trigger()
-
-            # Poll for result
-            deadline = time.time() + TIMEOUT
-            while time.time() < deadline:
-                if result_file.exists():
+            try:
+                delivery = self._type_dispatch_trigger(request_id)
+            except Exception as exc:
+                cancelled = cancel_unclaimed(self._ipc_dir, request_id)
+                receipt = {
+                    "request_id": request_id,
+                    "protocol": PROTOCOL,
+                    "state": "cancelled" if cancelled else "uncertain",
+                    "error": str(exc),
+                }
+                publish(archive / f"{request_id}.transport.json", receipt)
+                return CommandResult(ok=False, error=str(exc), payload=receipt), not cancelled
+            publish(
+                archive / f"{request_id}.delivery.json",
+                {"request_id": request_id, "delivery": delivery},
+            )
+            start = time.monotonic()
+            deadline = start + (TIMEOUT if timeout is None else timeout)
+            while True:
+                if files["result"].exists():
                     try:
-                        # AutoCAD LISP writes files in Windows-1252 encoding;
-                        # try UTF-8 first (covers ASCII), fall back to cp1252
-                        try:
-                            text = result_file.read_text(encoding="utf-8")
-                        except UnicodeDecodeError:
-                            text = result_file.read_text(encoding="cp1252")
-                        data = json.loads(text)
-                        # Verify request_id matches
+                        data = read_json(files["result"])
                         if data.get("request_id") == request_id:
+                            # A v2 result alone is not enough: require its original claim.
+                            if (
+                                not files["claimed"].exists()
+                                or read_json(files["claimed"]) != payload
+                            ):
+                                return CommandResult(
+                                    ok=False,
+                                    error="IPC_CLAIM_PROOF_MISSING",
+                                    payload={"request_id": request_id},
+                                ), True
+                            publish(archive / f"{request_id}.json", data)
+                            completed = True
                             return CommandResult(
                                 ok=data.get("ok", False),
                                 payload=data.get("payload"),
                                 error=data.get("error"),
-                            )
-                    except (json.JSONDecodeError, OSError):
-                        pass  # File may be partially written, retry
+                                receipt={'request_id':request_id, 'protocol':PROTOCOL,
+                                         'archive':str(archive/f'{request_id}.json'),
+                                         'delivery':delivery},
+                            ), True
+                    except (ValueError, OSError):
+                        pass
+                elapsed = time.monotonic() - start
+                claimed = files["claimed"].exists()
+                if time.monotonic() >= deadline or (not claimed and elapsed >= PICKUP_TIMEOUT):
+                    # Rename competes with the dispatcher's rename-before-read. Never
+                    # delete READY: a disappearance without proof is still uncertain.
+                    cancelled = cancel_unclaimed(self._ipc_dir, request_id)
+                    receipt = {
+                        "request_id": request_id,
+                        "protocol": PROTOCOL,
+                        "state": "cancelled" if cancelled else "uncertain",
+                        "claimed": files["claimed"].exists(),
+                        "delivery": delivery,
+                    }
+                    publish(archive / f"{request_id}.transport.json", receipt)
+                    error = (
+                        "IPC_NOT_PICKED_UP_CANCELLED; inspect desktop and acknowledge; do not retry"
+                        if cancelled
+                        else "IPC_TIMEOUT_RECONCILE_REQUIRED; command may still be running"
+                    )
+                    return CommandResult(ok=False, error=error, payload=receipt), not cancelled
                 await asyncio.sleep(POLL_INTERVAL)
-
-            return CommandResult(ok=False, error=f"Timeout waiting for result (request_id={request_id})")
-
         finally:
-            # Cleanup
-            for f in (cmd_file, result_file, tmp_file):
-                try:
-                    f.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            if completed:
+                pending_file.unlink(missing_ok=True)
+            # Keep ready/claim/cancellation/result evidence even on process cancellation.
+            # An unresolved pending marker fences every other client until reconciled.
 
-    def _find_command_line_hwnd(self) -> int | None:
-        """Find AutoCAD's MDIClient child window for command routing."""
-        if sys.platform != "win32" or not self._hwnd:
-            return None
-        try:
-            import win32gui
+    def _type_dispatch_trigger(self, request_id: str):
+        """Bootstrap per document, then invoke only this request. No second trigger."""
+        if self._transport == 'worker':
+            if not self._worker_session:
+                raise RuntimeError('WORKER_NOT_BOUND')
+            # Publication is the trigger. Native claim/cancel remains authoritative.
+            # No window message, focus change, keyboard fallback or auto-restart.
+            return {"mode": "native_queue_worker", "session": self._worker_session}
+        # A distinct filename namespace prevents legacy wildcard dispatchers from
+        # consuming v2 requests, including delayed triggers from an old client.
+        path = self._lisp_path.replace('"', '\\"')
+        expression = f'(mcp-dispatch-v2 "{request_id}")'
+        if AUTOLOAD_DISPATCHER:
+            expression = (
+                f'(progn (if (not (equal *mcp-ipc-protocol* 2)) (load "{path}")) {expression})'
+            )
+        return self._post_text(expression)
 
-            mdi_client: list[int] = []
-
-            def cb(child_hwnd, _):
-                if win32gui.GetClassName(child_hwnd) == "MDIClient":
-                    mdi_client.append(child_hwnd)
-                    return False  # stop enumeration
-                return True
-
-            win32gui.EnumChildWindows(self._hwnd, cb, None)
-            return mdi_client[0] if mdi_client else None
-        except Exception:
-            return None
-
-    def _type_dispatch_trigger(self):
-        """Post '(c:mcp-dispatch)' + Enter via WM_CHAR to MDIClient — no focus steal.
-
-        Sends ESC keystrokes first to cancel any stale pending command
-        (e.g. from a previous timeout leaving AutoCAD in a command prompt).
-        """
-        try:
-            import ctypes
-
-            WM_CHAR = 0x0102
-            WM_KEYDOWN = 0x0100
-            WM_KEYUP = 0x0101
-            VK_ESCAPE = 0x1B
-            target = self._command_hwnd or self._hwnd
-            post = ctypes.windll.user32.PostMessageW
-
-            # Cancel any pending command (2x ESC for nested commands)
-            for _ in range(2):
-                post(target, WM_KEYDOWN, VK_ESCAPE, 0)
-                post(target, WM_KEYUP, VK_ESCAPE, 0)
-            time.sleep(0.05)
-
-            for ch in "(c:mcp-dispatch)":
-                post(target, WM_CHAR, ord(ch), 0)
-            # Enter = carriage return
-            post(target, WM_CHAR, 0x0D, 0)
-            time.sleep(0.05)
-        except Exception as e:
-            log.error("dispatch_trigger_failed", error=str(e))
+    def _post_text(self, text: str):
+        return post_expression(self._hwnd, text)
 
     def _cleanup_stale_files(self):
-        """Remove stale IPC files from previous sessions."""
-        try:
-            now = time.time()
-            for pattern in ("autocad_mcp_*.json", "autocad_mcp_*.tmp", "autocad_mcp_lisp_*.lsp"):
-                for f in self._ipc_dir.glob(pattern):
-                    if now - f.stat().st_mtime > STALE_THRESHOLD:
-                        f.unlink(missing_ok=True)
-        except OSError:
-            pass
+        """Retain IPC evidence; elapsed age never proves a native command completed."""
+        return
 
     # --- Drawing management ---
 
@@ -260,9 +340,16 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("drawing-info", {})
 
     async def drawing_save(self, path: str | None = None) -> CommandResult:
+        if self._transport == 'worker':
+            if path is None:
+                from autocad_mcp.native_save import save_current
+                return await save_current(self)
+            return await self.worker_transition('save', path)
         return await self._dispatch("drawing-save", {"path": path})
 
     async def drawing_save_as_dxf(self, path: str) -> CommandResult:
+        if self._transport == 'worker':
+            return CommandResult(ok=False, error='WORKER_DXF_TRANSITION_NOT_QUALIFIED')
         return await self._dispatch("drawing-save-as-dxf", {"path": path})
 
     async def drawing_create(self, name: str | None = None) -> CommandResult:
@@ -272,7 +359,7 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("drawing-purge", {})
 
     async def drawing_plot_pdf(self, path: str) -> CommandResult:
-        return await self._dispatch("drawing-plot-pdf", {"path": path})
+        return await self._dispatch("drawing-plot-pdf", {"path": path}, timeout=LONG_TIMEOUT)
 
     async def drawing_get_variables(self, names: list[str] | None = None) -> CommandResult:
         if names:
@@ -284,6 +371,8 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("drawing-get-variables", {"names_str": names_str})
 
     async def drawing_open(self, path: str) -> CommandResult:
+        if self._transport == 'worker':
+            return await self.worker_transition('open', path)
         return await self._dispatch("drawing-open", {"path": path})
 
     # --- Undo / Redo ---
@@ -301,12 +390,18 @@ class FileIPCBackend(AutoCADBackend):
 
         File persists for session; cleaned up by _cleanup_stale_files().
         """
+        from autocad_mcp.lisp_preflight import LispPreflightError, validate
+
+        try:
+            validate(code)
+        except LispPreflightError as exc:
+            return CommandResult(ok=False, error=str(exc), payload={"dispatched": False})
         request_id = uuid.uuid4().hex[:12]
         code_file = self._ipc_dir / f"autocad_mcp_lisp_{request_id}.lsp"
         code_file.write_text(code, encoding="utf-8")
         return await self._dispatch("execute-lisp", {
             "code_file": str(code_file).replace("\\", "/")
-        })
+        }, timeout=LONG_TIMEOUT)
 
     # --- Entity operations ---
 
@@ -334,8 +429,8 @@ class FileIPCBackend(AutoCADBackend):
     async def create_mtext(self, x, y, width, text, height=2.5, layer=None) -> CommandResult:
         return await self._dispatch("create-mtext", {"x": x, "y": y, "width": width, "text": text, "height": height, "layer": layer})
 
-    async def create_hatch(self, entity_id, pattern="ANSI31") -> CommandResult:
-        return await self._dispatch("create-hatch", {"entity_id": entity_id, "pattern": pattern})
+    async def create_hatch(self, entity_id, pattern="ANSI31", scale=1.0, angle=0.0) -> CommandResult:
+        return await self._dispatch("create-hatch", {"entity_id": entity_id, "pattern": pattern, "scale": scale, "angle": angle})
 
     async def entity_list(self, layer=None) -> CommandResult:
         return await self._dispatch("entity-list", {"layer": layer})
@@ -490,6 +585,18 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("zoom-window", {"x1": x1, "y1": y1, "x2": x2, "y2": y2})
 
     async def get_screenshot(self) -> CommandResult:
+        if self._hwnd and sys.platform == "win32":
+            try:
+                import win32gui
+
+                # PrintWindow on a minimized window returns an all-black image
+                if win32gui.IsIconic(self._hwnd):
+                    return CommandResult(
+                        ok=False,
+                        error="AutoCAD window is minimized; restore it to capture a screenshot",
+                    )
+            except ImportError:
+                pass
         if self._screenshot_provider:
             data = self._screenshot_provider.capture()
             if data:
